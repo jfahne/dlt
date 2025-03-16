@@ -1,7 +1,10 @@
+import gc
 import posixpath
 import os
 import base64
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext, ExitStack
+from functools import partial
+import sys
 from types import TracebackType
 from typing import (
     ContextManager,
@@ -18,6 +21,12 @@ from typing import (
     Any,
     Dict,
 )
+
+if sys.version_info.minor >= 10:  # Python3.10 adds support for TypeAlias
+    from typing import TypeAlias
+else:  # Python 3.9 supported by package requires typing-extensions use
+    from typing_extensions import TypeAlias
+
 from fsspec import AbstractFileSystem
 
 import dlt
@@ -67,55 +76,353 @@ from dlt.destinations.utils import verify_schema_merge_disposition
 INIT_FILE_NAME = "init"
 FILENAME_SEPARATOR = "__"
 
+from typing import Protocol
+from collections.abc import abstractmethod
 
-class FilesystemLoadJob(RunnableLoadJob):
-    def __init__(
-        self,
-        file_path: str,
-    ) -> None:
-        super().__init__(file_path)
-        self._job_client: FilesystemClient = None
 
-    def run(self) -> None:
-        self.__is_local_filesystem = self._job_client.config.is_local_filesystem
-        # We would like to avoid failing for local filesystem where
-        # deeply nested directory will not exist before writing a file.
-        # It `auto_mkdir` is disabled by default in fsspec so we made some
-        # trade offs between different options and decided on this.
-        # remote_path = f"{client.config.protocol}://{posixpath.join(dataset_path, destination_file_name)}"
-        remote_path = self.make_remote_path()
-        if self.__is_local_filesystem:
-            # use os.path for local file name
-            self._job_client.fs_client.makedirs(os.path.dirname(remote_path), exist_ok=True)
-        self._job_client.fs_client.put_file(self._file_path, remote_path)
+class IFilesystemLoadJob(Protocol):
+    """Interface defining a file system load job."""
 
-    def make_remote_path(self) -> str:
-        """Returns path on the remote filesystem to which copy the file, without scheme. For local filesystem a native path is used"""
-        destination_file_name = path_utils.create_path(
-            self._job_client.config.layout,
-            self._file_name,
-            self._job_client.schema.name,
-            self._load_id,
-            current_datetime=self._job_client.config.current_datetime,
-            load_package_timestamp=dlt.current.load_package()["state"]["created_at"],
-            extra_placeholders=self._job_client.config.extra_placeholders,
-        )
-        # pick local filesystem pathlib or posix for buckets
-        pathlib = os.path if self.__is_local_filesystem else posixpath
-        # path.join does not normalize separators and available
-        # normalization functions are very invasive and may string the trailing separator
-        return pathlib.join(  # type: ignore[no-any-return]
-            self._job_client.dataset_path,
-            path_utils.normalize_path_sep(pathlib, destination_file_name),
-        )
+    @property
+    @abstractmethod
+    def source_file_path(self) -> str:
+        """Getter of fs load job source read location.
 
-    def make_remote_url(self) -> str:
-        """Returns path on a remote filesystem as a full url including scheme."""
-        return self._job_client.make_remote_url(self.make_remote_path())
+        Returns:
+            The target location for a file system write/put command.
+        """
+
+        raise NotImplementedError
+
+    @abstractmethod
+    def run(self, job_client: FilesystemClient = None) -> None:
+        """Execute fs load job taking write execution client.
+
+        Args:
+            job_client: Client for executing write/put.
+        """
+
+        raise NotImplementedError
 
     def metrics(self) -> Optional[LoadJobMetrics]:
-        m = super().metrics()
-        return m._replace(remote_url=self.make_remote_url())
+        """Produce metrics for fs load job.
+
+        By default, no metrics are returned.
+        Overrides subclassing `RunnableLoadJob`
+        and other similar classes with `metrics()` methods
+        should call and modify the parent method
+        to produce metrics to return.
+
+        Returns:
+            An optional `LoadJobMetrics` object with fs load job info.
+        """
+
+        return None
+
+
+class IWithArrowDataset(Protocol):
+    """Interface defining objects which prepare an arrow dataset property."""
+
+    @property
+    @abstractmethod
+    def arrow_dataset(self) -> "pyarrow.dataset.Dataset":
+        """Getter for an arrow dataset."""
+
+        raise NotImplementedError
+
+
+# class IWithPartitioning(Protocol):
+#     """Interface defining objects which have a set of columns for partitioning."""
+
+#     @property
+#     @abstractmethod
+#     def partition_columns(self) -> list[str]:
+#         """Getter for a list of column names to use when partitioning data."""
+
+#         raise NotImplementedError
+
+
+class PathJoiner(Protocol):
+    """TODO"""
+
+    @abstractmethod
+    def join(path: os.PathLike, *paths: os.PathLike) -> os.PathLike:
+        raise NotImplementedError
+
+
+def make_remote_url(
+    config: FilesystemDestinationClientConfiguration, remote_path: str, is_local_filesystem: bool
+) -> str:
+    """Returns uri to the remote filesystem to which copy the file"""
+    if is_local_filesystem:
+        return config.make_file_url(remote_path)
+    else:
+        return config.make_url(remote_path)
+
+
+def make_remote_path(job: IFilesystemLoadJob, pathlib: PathJoiner = os.path) -> os.PathLike:
+    """Returns path on the remote filesystem to which copy the file, without scheme. For local filesystem a native path is used"""
+    destination_file_name = path_utils.create_path(
+        job._job_client.config.layout,
+        job._file_name,
+        job._job_client.schema.name,
+        job._load_id,
+        current_datetime=job._job_client.config.current_datetime,
+        load_package_timestamp=dlt.current.load_package()["state"]["created_at"],
+        extra_placeholders=job._job_client.config.extra_placeholders,
+    )
+    # path.join does not normalize separators and available
+    # normalization functions are very invasive and may string the trailing separator
+    return pathlib.join(  # type: ignore[no-any-return]
+        job._job_client.dataset_path,
+        path_utils.normalize_path_sep(pathlib, destination_file_name),
+    )
+
+
+def get_table_dir(job_client: FilesystemClient, table_name: str, remote: bool = False) -> str:
+    # dlt tables do not respect layout (for now)
+    table_prefix = get_table_prefix(job_client, table_name)
+    table_dir: str = job_client.pathlib.dirname(table_prefix)
+    if remote:
+        table_dir = job_client.make_remote_url(table_dir)
+    return table_dir
+
+
+def get_table_prefix(job_client: FilesystemClient, table_name: str) -> str:
+    # dlt tables do not respect layout (for now)
+    if table_name.startswith(job_client.schema._dlt_tables_prefix):
+        # dlt tables get layout where each tables is a folder
+        # it is crucial to append and keep "/" at the end
+        table_prefix = job_client.pathlib.join(table_name, "")
+    else:
+        table_prefix = job_client.table_prefix_layout.format(
+            schema_name=job_client.schema.name, table_name=table_name
+        )
+    return job_client.pathlib.join(  # type: ignore[no-any-return]
+        job_client.dataset_path, path_utils.normalize_path_sep(self.pathlib, table_prefix)
+    )
+
+
+def get_delta_lake_storage_options_from_config(
+    config: FilesystemDestinationClientConfiguration,
+) -> dict[str, str]:
+    from dlt.common.libs.deltalake import _deltalake_storage_options
+
+    return _deltalake_storage_options(config)
+
+
+class LocalFileSystemLoadJob(RunnableLoadJob):
+    @property
+    def source_file_path(self) -> str:
+        return self._file_path
+
+    @override
+    def run(self, job_client: FilesytemClient) -> None:
+
+        # Prepare commands
+        client = job_client.fs_client
+        remote_path = make_remote_path(self)
+
+        # Execute commands
+        client.makedirs(os.path.dirname(remote_path), exist_ok=True)
+        client.put_file(self.source_file_path, remote_path)
+
+    @override
+    def metrics(self) -> Optional[LoadJobMetrics]:
+        return FilesystemDestinationClientConfiguration.make_file_url(make_remote_path(self))
+
+
+class RemoteFileSystemLoadJob(RunnableLoadJob):
+    @property
+    def source_file_path(self) -> str:
+        return self._file_path
+
+    @override
+    def run(self, job_client: FilesystemClient) -> None:
+
+        # Prepare commands
+        client = job_client.fs_client
+        remote_path = make_remote_path(self, posixpath)
+
+        # Execute commands
+        client.put_file(self.source_file_path, remote_path)
+
+    @override
+    def metrics(self) -> Optional[LoadJobMetrics]:
+        return FilesystemDestinationClientConfiguration.make_url(make_remote_path(self, posixpath))
+
+
+def create_or_evolve_lazy_delta_table(
+    maybe_lazy_delta_table: LazyDeltaTable | None,
+    table_uri: str,
+    arrow_schema: "pyarrow.Schema",
+    partition_column_names: list[str],
+    storage_options: dict[str, str],
+) -> LazyDeltaTable:
+    from dlt.common.libs.deltalake import (
+        DeltaTable,
+        ensure_delta_compatible_arrow_schema,
+        _evolve_delta_table_schema,
+    )
+
+    if lazy_delta_table is not None:
+        return lambda: _evolve_delta_table_schema(lazy_delta_table(), arrow_schema)
+    return lambda: DeltaTable.create(
+        table_uri=table_uri,
+        schema=ensure_delta_compatible_arrow_schema(arrow_schema),
+        mode="overwrite",
+        partition_by=partition_column_names,
+        storage_options=storage_options,
+    )
+
+
+@contextmanager
+def managed_delta_table(
+    maybe_lazy_delta_table: LazyDeltaTable | None,
+    table_uri: str,
+    maybe_source_dataset: Optional["pyarrow.dataset.Dataset"],
+    partition_column_names: list[str],
+    storage_options: dict[str, str],
+) -> "DeltaTable" | None:
+    managed_table: LazyDeltaTable | None = maybe_lazy_delta_table
+    if maybe_source_dataset is None and maybe_lazy_delta_table is not None:
+        managed_table = create_or_evolve_delta_table(
+            lazy_delta_table,
+            table_uri,
+            source_dataset_schema,
+            partition_column_names,
+            storage_options,
+        )
+    yield managed_table
+    del managed_table
+    # instruct garbage collector manually
+    # to minimize memory fragmentation
+    # caused by free lists
+    gc.collect()
+
+
+@contextmanager
+def managed_pyarrow_dataset(lazy_pyarrow_dataset: LazyPyArrowDataset) -> "pyarrow.dataset.Dataset":
+    pyarrow_dataset: "pyarrow.dataset.Dataset" = lazy_pyarrow_dataset()
+    if pyarrow_dataset.head(1).num_rows != 0:
+        yield pyarrow_dataset
+        del pyarrow_dataset
+        gc.collect()
+    yield None
+
+
+def arrow_record_batch_reader_if_needed(source_dataset):
+    if source_dataset is None:
+        return nullcontext()
+    return source_dataset.scanner().to_reader()
+
+
+LazyDeltaTable: TypeAlias = Callable[[], "DeltaTable"]
+
+
+class DeltaTableFileSystemLoadJob(RunnableLoadJob):
+    @property
+    def source_file_paths_from_reference(self):
+        return ReferenceFollowupJobRequest.resolve_references(self._file_path)
+
+    def arrow_dataset(self) -> "pyarrow.dataset.Dataset":
+        from dlt.common.libs.pyarrow import pyarrow
+
+        return pyarrow.dataset.dataset(self.source_file_paths_from_reference)
+
+    @override
+    def run(self, job_client: FilesystemClient) -> None:
+
+        # Prepare
+
+        table_for_load: PreparedTableSchema = self._load_table
+        write_disposition: str = table_for_load["write_disposition"]
+        is_merge_table: bool = write_disposition == "merge"
+        remote_path: os.PathLike = get_table_dir(job_client, self.load_table_name)
+        remote_url: os.PathLike = make_remote_url(
+            job_client.config, remote_path, job_client.is_local_filesystem
+        )
+        partition_column_names: list[str] = get_columns_names_with_prop(table_for_load, "partition")
+        storage_options: dict[str, str] = get_delta_lake_storage_options_from_config(
+            job_client.config
+        )
+
+        # create Arrow dataset from Parquet files
+        from dlt.common.libs.deltalake import write_delta_table, merge_delta_table, DeltaTable
+
+        is_delta_table: bool = DeltaTable.is_deltatable(remote_url, storage_options=storage_options)
+        maybe_lazy_delta_table: LazyDeltaTable | None = (
+            (lambda: DeltaTable(remote_url, storage_options=storage_options))
+            if is_delta_table
+            else None
+        )
+
+        lazy_source_dataset = self.arrow_dataset
+
+        with ExitStack() as exit_stack:
+            managed_source_dataset: "pyarrow.dataset.Dataset" = exit_stack.enter_context(
+                managed_pyarrow_dataset(lazy_source_dataset)
+            )
+            # explicitly check if there is data
+            # (https://github.com/delta-io/delta-rs/issues/2686)
+            logger.info(
+                f"Will copy file(s) {self.source_file_paths_from_reference} to delta table {remote_url} [arrow"
+                f" buffer: {pa.total_allocated_bytes()}]"
+            )
+            managed_table: DeltaTable | None = exit_stack.enter_context(
+                managed_delta_table(
+                    maybe_lazy_delta_table,
+                    remote_url,
+                    managed_source_dataset,
+                    partition_column_names,
+                    storage_options,
+                )
+            )
+
+            does_table_exist: bool = managed_table is not None
+
+            source_record_batch_reader: pa.RecordBatchReader | None = exit_stack.enter_context(
+                arrow_record_batch_reader_if_needed(managed_source_dataset)
+            )
+
+            if source_record_batch_reader is None:  # no data to merge or write
+                exit_stack.close()
+
+            if is_merge_table and does_table_exist:
+                merge_delta_table(
+                    table=managed_table,
+                    data=source_record_batch_reader,
+                    schema=table_for_load,
+                )
+                exit_stack.close()
+
+            write_delta_table_for_table_or_uri = partial(
+                write_delta_table,
+                data=source_record_batch_reader,
+                write_disposition=write_disposition,
+                partition_by=get_columns_names_with_prop(table_for_load, "partition"),
+                storage_options=get_delta_lake_storage_options_from_config(job_client.config),
+            )
+
+            if does_table_exist:
+                write_delta_table_for_table_or_uri(table_or_uri=managed_table)
+                exit_stack.close()
+
+            write_delta_table_for_table_or_uri(
+                table_or_uri=make_remote_url(
+                    job_client.config, remote_path, job_client.is_local_filesystem
+                )
+            )
+
+        del source_dataset
+        gc.collect()
+        logger.info(
+            f"Copied {self.file_paths} to delta table {remote_url} [arrow buffer:"
+            f" {pa.total_allocated_bytes()}]"
+        )
+
+    @override
+    def metrics(self) -> Optional[LoadJobMetrics]: ...
 
 
 class TableFormatLoadFilesystemJob(FilesystemLoadJob):
@@ -136,82 +443,6 @@ class TableFormatLoadFilesystemJob(FilesystemLoadJob):
     @property
     def _partition_columns(self) -> List[str]:
         return get_columns_names_with_prop(self._load_table, "partition")
-
-
-class DeltaLoadFilesystemJob(TableFormatLoadFilesystemJob):
-    def run(self) -> None:
-        # create Arrow dataset from Parquet files
-        from dlt.common.libs.pyarrow import pyarrow as pa
-        from dlt.common.libs.deltalake import write_delta_table, merge_delta_table
-
-        logger.info(
-            f"Will copy file(s) {self.file_paths} to delta table {self.make_remote_url()} [arrow"
-            f" buffer: {pa.total_allocated_bytes()}]"
-        )
-        source_ds = self.arrow_dataset
-        delta_table = self._delta_table()
-
-        # explicitly check if there is data
-        # (https://github.com/delta-io/delta-rs/issues/2686)
-        if source_ds.head(1).num_rows == 0:
-            delta_table = self._create_or_evolve_delta_table(source_ds, delta_table)
-        else:
-            with source_ds.scanner().to_reader() as arrow_rbr:  # RecordBatchReader
-                if self._load_table["write_disposition"] == "merge" and delta_table is not None:
-                    merge_delta_table(
-                        table=delta_table,
-                        data=arrow_rbr,
-                        schema=self._load_table,
-                    )
-                else:
-                    write_delta_table(
-                        table_or_uri=(
-                            self.make_remote_url() if delta_table is None else delta_table
-                        ),
-                        data=arrow_rbr,
-                        write_disposition=self._load_table["write_disposition"],
-                        partition_by=self._partition_columns,
-                        storage_options=self._storage_options,
-                    )
-        # release memory ASAP by deleting objects explicitly
-        del source_ds
-        del delta_table
-        logger.info(
-            f"Copied {self.file_paths} to delta table {self.make_remote_url()} [arrow buffer:"
-            f" {pa.total_allocated_bytes()}]"
-        )
-
-    @property
-    def _storage_options(self) -> Dict[str, str]:
-        from dlt.common.libs.deltalake import _deltalake_storage_options
-
-        return _deltalake_storage_options(self._job_client.config)
-
-    def _delta_table(self) -> Optional["DeltaTable"]:  # type: ignore[name-defined] # noqa: F821
-        from dlt.common.libs.deltalake import DeltaTable
-
-        if DeltaTable.is_deltatable(self.make_remote_url(), storage_options=self._storage_options):
-            return DeltaTable(self.make_remote_url(), storage_options=self._storage_options)
-        else:
-            return None
-
-    def _create_or_evolve_delta_table(self, arrow_ds: "Dataset", delta_table: "DeltaTable") -> "DeltaTable":  # type: ignore[name-defined] # noqa: F821
-        from dlt.common.libs.deltalake import (
-            DeltaTable,
-            ensure_delta_compatible_arrow_schema,
-            _evolve_delta_table_schema,
-        )
-
-        if delta_table is None:
-            return DeltaTable.create(
-                table_uri=self.make_remote_url(),
-                schema=ensure_delta_compatible_arrow_schema(arrow_ds.schema),
-                mode="overwrite",
-                partition_by=self._partition_columns,
-                storage_options=self._storage_options,
-            )
-        else:
-            return _evolve_delta_table_schema(delta_table, arrow_ds.schema)
 
 
 class IcebergLoadFilesystemJob(TableFormatLoadFilesystemJob):

@@ -123,7 +123,8 @@ class FilesystemSqlClient(DuckDbSqlClient):
 
             s3_url_style = aws_creds.s3_url_style or "vhost"
 
-            self._conn.sql(f"""
+            self._conn.sql(
+                f"""
             CREATE OR REPLACE {persistent_stmt} SECRET {secret_name} (
                 TYPE S3,
                 KEY_ID '{aws_creds.aws_access_key_id}',
@@ -134,26 +135,30 @@ class FilesystemSqlClient(DuckDbSqlClient):
                 SCOPE '{scope}',
                 URL_STYLE '{s3_url_style}',
                 USE_SSL {use_ssl}
-            );""")
+            );"""
+            )
 
         # azure with storage account creds
         elif self.fs_client.config.protocol in ["az", "abfss"] and isinstance(
             self.fs_client.config.credentials, AzureCredentialsWithoutDefaults
         ):
             azsa_creds = self.fs_client.config.credentials
-            self._conn.sql(f"""
+            self._conn.sql(
+                f"""
             CREATE OR REPLACE {persistent_stmt} SECRET {secret_name} (
                 TYPE AZURE,
                 CONNECTION_STRING 'AccountName={azsa_creds.azure_storage_account_name};AccountKey={azsa_creds.azure_storage_account_key}',
                 SCOPE '{scope}'
-            );""")
+            );"""
+            )
 
         # azure with service principal creds
         elif self.fs_client.config.protocol in ["az", "abfss"] and isinstance(
             self.fs_client.config.credentials, AzureServicePrincipalCredentialsWithoutDefaults
         ):
             azsp_creds = self.fs_client.config.credentials
-            self._conn.sql(f"""
+            self._conn.sql(
+                f"""
             CREATE OR REPLACE {persistent_stmt} SECRET {secret_name} (
                 TYPE AZURE,
                 PROVIDER SERVICE_PRINCIPAL,
@@ -162,7 +167,8 @@ class FilesystemSqlClient(DuckDbSqlClient):
                 CLIENT_SECRET '{azsp_creds.azure_client_secret}',
                 ACCOUNT_NAME '{azsp_creds.azure_storage_account_name}',
                 SCOPE '{scope}'
-            );""")
+            );"""
+            )
         elif persistent:
             raise Exception(
                 "Cannot create persistent secret for filesystem protocol"
