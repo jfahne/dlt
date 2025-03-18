@@ -1,23 +1,36 @@
 import os
-from typing import Final, Protocol
+from typing import Any, Final, Protocol, TYPE_CHECKING, Union
+
+from dlt.common.destination.client import JobClientBase
 from dlt.common.destination.typing import PreparedTableSchema
 from dlt.common.schema.utils import get_columns_names_with_prop
 
-DLT_PYARROW_MODULE_NAME: Final[str] = "pyarrow"
-PREPARED_TABLE_SCHEMA_PROPERTY_PARTITION: Final[str] = "partition"
-LOAD_TABLE_WRITE_DISPOSITION_KEY: Final[str] = "write_disposition"
+if TYPE_CHECKING:
+    from dlt.common.libs.pyarrow import pyarrow as pa
+
+DLT_PYARROW_MODULE_NAME: Final = "pyarrow"
+PREPARED_TABLE_SCHEMA_PROPERTY_PARTITION: Final = "partition"
+LOAD_TABLE_WRITE_DISPOSITION_KEY: Final = "write_disposition"
 
 
 class HasSourceFilePaths(Protocol):
+    """Objects which have source data stored across one or more files."""
+
     file_paths: list[str]
 
 
 class HasNamedLoadTable(Protocol):
-    load_table_name: str
+    """Objects which have a table name and schema into which data is loaded."""
+
     _load_table: PreparedTableSchema
+
+    @property
+    def load_table_name(self) -> str: ...
 
 
 class HasTableDirectoryGetter(Protocol):
+    """Objects which allow retrieving the directory of a table stored in a filesystem."""
+
     def get_table_dir(self, table_name: str) -> str:
         """Retrieves the directory in a filesystem for a table object by name.
         Args:
@@ -29,7 +42,9 @@ class HasTableDirectoryGetter(Protocol):
 
 
 class HasRemotePathBuilder(Protocol):
-    def make_remote_path(self) -> os.PathLike:
+    """Objects which build a path in reference to a remote filesystem."""
+
+    def make_remote_path(self) -> str:
         """Builds remote path for a job or other object.
         Returns:
             remote path for references to systems like S3, GCS, etc
@@ -38,7 +53,9 @@ class HasRemotePathBuilder(Protocol):
 
 
 class HasRemoteUrlBuilder(Protocol):
-    def make_remote_url(self, remote_path: os.PathLike) -> str:
+    """Objects which build a url given a path referencing a remote filesystem."""
+
+    def make_remote_url(self, remote_path: str) -> str:
         """Take a remote path and qualify it as needed for use as a url.
         Args:
             remote_path: path-like value to qualify as url
@@ -50,7 +67,7 @@ class HasRemoteUrlBuilder(Protocol):
 
 def make_remote_path_for_filesystem_destination(
     job: HasNamedLoadTable, job_client: HasTableDirectoryGetter
-) -> os.PathLike:
+) -> str:
     """Builds a remote path for a named load table from a table directory getter.
     Args:
         job: load job with a named destination table
@@ -58,7 +75,7 @@ def make_remote_path_for_filesystem_destination(
     Returns:
         remote path housing files/objects for a table
     """
-    return job.make_remote_path(job_client.get_table_dir(job.load_table_name))
+    return job_client.get_table_dir(job.load_table_name)
 
 
 def make_remote_url_for_filesystem_destination(
@@ -75,7 +92,7 @@ def make_remote_url_for_filesystem_destination(
     return job_client.make_remote_url(job.make_remote_path())
 
 
-def get_arrow_dataset_for_filesystem_source(job: HasSourceFilePaths) -> "Dataset":
+def get_arrow_dataset_for_filesystem_source(job: HasSourceFilePaths) -> "pa.Dataset":
     """Imports common pyarrow library when needed to produce dataset for source file paths.
     Args:
         job: job with a source table spread across one or more files
@@ -95,4 +112,5 @@ def get_partition_column_names_for_named_load_table(job: HasNamedLoadTable) -> l
     Returns:
         list of column names to use for partitioning the destination table
     """
+
     return get_columns_names_with_prop(job._load_table, PREPARED_TABLE_SCHEMA_PROPERTY_PARTITION)

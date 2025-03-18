@@ -1,23 +1,35 @@
 import os
-from typing import Final, Optional
+from typing import Final, Optional, TYPE_CHECKING
 
 from dlt.common import logger
 from dlt.common.destination.client import RunnableLoadJob
 from dlt.common.metrics import LoadJobMetrics
 from dlt.destinations.job_impl import ReferenceFollowupJobRequest
-from dlt.destinations.impl.filesystem.table_format.common import LOAD_TABLE_WRITE_DISPOSITION_KEY
+from dlt.destinations.impl.filesystem.table_format.common import (
+    LOAD_TABLE_WRITE_DISPOSITION_KEY,
+    make_remote_path_for_filesystem_destination,
+    make_remote_url_for_filesystem_destination,
+    get_arrow_dataset_for_filesystem_source,
+    get_partition_column_names_for_named_load_table,
+)
 
-WRITE_DISPOSITION_MERGE: Final[str] = "merge"
-DELTA_TABLE_CREATE_MODE_OVERWRITE: Final[str] = "overwrite"
+if TYPE_CHECKING:
+    from dlt.common.libs.pyarrow import pyarrow as pa
+    from dlt.destinations.impl.filesystem.filesystem import FilesystemClient
+
+WRITE_DISPOSITION_MERGE: Final = "merge"
+DELTA_TABLE_CREATE_MODE_OVERWRITE: Final = "overwrite"
 
 
 class DeltaLoadFilesystemJob(RunnableLoadJob):
-    def __init__(self, file_path: os.PathLike):
+    """Job which loads data to a filesystem via the LFAI Delta specification."""
+
+    def __init__(self, file_path: str):
         super().__init__(file_path)
         self._job_client: "FilesystemClient" = None
         self.file_paths = ReferenceFollowupJobRequest.resolve_references(self._file_path)
 
-    def make_remote_path(self) -> os.PathLike:
+    def make_remote_path(self) -> str:
         """Builds a remote path for a Delta table destination.
         Returns:
             remote path housing Delta table files/objects
@@ -32,7 +44,7 @@ class DeltaLoadFilesystemJob(RunnableLoadJob):
         return make_remote_url_for_filesystem_destination(self, self._job_client)
 
     @property
-    def arrow_dataset(self):
+    def arrow_dataset(self) -> "pa.Dataset":
         return get_arrow_dataset_for_filesystem_source(self)
 
     @property
@@ -85,7 +97,7 @@ class DeltaLoadFilesystemJob(RunnableLoadJob):
         )
 
     @property
-    def _storage_options(self) -> Dict[str, str]:
+    def _storage_options(self) -> dict[str, str]:
         from dlt.common.libs.deltalake import _deltalake_storage_options
 
         return _deltalake_storage_options(self._job_client.config)

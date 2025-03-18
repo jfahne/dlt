@@ -1,20 +1,32 @@
 import os
-from typing import Optional
+from typing import Any, Optional, TYPE_CHECKING
 
 from dlt.common import logger
 from dlt.common.metrics import LoadJobMetrics
 from dlt.destinations.job_impl import ReferenceFollowupJobRequest
 from dlt.common.destination.client import RunnableLoadJob
-from dlt.destinations.impl.filesystem.table_format.common import LOAD_TABLE_WRITE_DISPOSITION_KEY
+from dlt.destinations.impl.filesystem.table_format.common import (
+    LOAD_TABLE_WRITE_DISPOSITION_KEY,
+    make_remote_path_for_filesystem_destination,
+    make_remote_url_for_filesystem_destination,
+    get_arrow_dataset_for_filesystem_source,
+    get_partition_column_names_for_named_load_table,
+)
+
+if TYPE_CHECKING:
+    from dlt.common.libs.pyarrow import pyarrow as pa
+    from dlt.destinations.impl.filesystem.filesystem import FilesystemClient
 
 
 class IcebergLoadFilesystemJob(RunnableLoadJob):
-    def __init__(self, file_path: os.PathLike):
+    """Job that loads data to a filesystem via the Apache Iceberg specification."""
+
+    def __init__(self, file_path: str):
         super().__init__(file_path)
         self._job_client: "FilesystemClient" = None
         self.file_paths = ReferenceFollowupJobRequest.resolve_references(self._file_path)
 
-    def make_remote_path(self) -> os.PathLike:
+    def make_remote_path(self) -> str:
         """Builds a remote path for an Iceberg table destination.
         Returns:
             remote path housing Delta table files/objects
@@ -30,7 +42,7 @@ class IcebergLoadFilesystemJob(RunnableLoadJob):
         return make_remote_url_for_filesystem_destination(self, self._job_client)
 
     @property
-    def arrow_dataset(self):
+    def arrow_dataset(self) -> "pa.Dataset":
         return get_arrow_dataset_for_filesystem_source(self)
 
     @property

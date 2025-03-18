@@ -37,6 +37,8 @@ from dlt.common.storages.load_package import (
     load_package as current_load_package,
 )
 from dlt.destinations.sql_client import WithSqlClient, SqlClientBase
+from dlt.destinations.impl.filesystem.table_format.delta import DeltaLoadFilesystemJob
+from dlt.destinations.impl.filesystem.table_format.iceberg import IcebergLoadFilesystemJob
 from dlt.common.destination import DestinationCapabilitiesContext
 from dlt.common.destination.client import (
     FollowupJobRequest,
